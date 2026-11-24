@@ -1,0 +1,392 @@
+name: NEXO Android Public Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release version tag (e.g., v0.1.0, v0.1.1, v0.2.0)"
+        required: true
+        default: "v0.1.0"
+      attach_to_release:
+        description: "Create or update GitHub Release for this tag and attach APKs"
+        type: boolean
+        required: false
+        default: true
+      update_release_folder:
+        description: "Update public-available-release/ on default branch"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nexo-android-release-${{ github.event.release.tag_name || inputs.release_tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-release-apk:
+    name: Build & Sign NEXO Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Status: Build Queued & Resolve Version Metadata"
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            RAW_TAG="${{ github.event.release.tag_name }}"
+          else
+            RAW_TAG="${{ inputs.release_tag }}"
+          fi
+
+          if [ -z "$RAW_TAG" ]; then
+            echo "::error::Release tag could not be determined."
+            exit 1
+          fi
+
+          # Strip leading 'v' for Android versionName (e.g., v0.1.0 -> 0.1.0)
+          VERSION_NAME="${RAW_TAG#v}"
+          # Normalize APK filename tag to start with 'v' (e.g., NEXO-v0.1.0-Public.apk)
+          if [[ "$RAW_TAG" == v* ]]; then
+            APK_TAG="$RAW_TAG"
+          else
+            APK_TAG="v$RAW_TAG"
+          fi
+
+          # Derive monotonic Android versionCode from semver (MAJOR*10000 + MINOR*100 + PATCH)
+          if [[ "$VERSION_NAME" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            MAJOR=$((10#${BASH_REMATCH[1]}))
+            MINOR=$((10#${BASH_REMATCH[2]}))
+            PATCH=$((10#${BASH_REMATCH[3]}))
+            VERSION_CODE=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+          elif [[ "$VERSION_NAME" =~ ^([0-9]+)\.([0-9]+) ]]; then
+            MAJOR=$((10#${BASH_REMATCH[1]}))
+            MINOR=$((10#${BASH_REMATCH[2]}))
+            VERSION_CODE=$((MAJOR * 10000 + MINOR * 100))
+          else
+            VERSION_CODE="${{ github.run_number }}"
+          fi
+
+          if [ "$VERSION_CODE" -lt 1 ]; then
+            VERSION_CODE=1
+          fi
+
+          APK_FILENAME="NEXO-${APK_TAG}-Public.apk"
+          LATEST_APK_FILENAME="NEXO-Public-Latest.apk"
+
+          echo "release_tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "apk_filename=$APK_FILENAME" >> "$GITHUB_OUTPUT"
+          echo "latest_apk_filename=$LATEST_APK_FILENAME" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Build Status: Build Queued"
+            echo "- **Trigger:** \`${{ github.event_name }}\`"
+            echo "- **Release Tag:** \`$RAW_TAG\`"
+            echo "- **Version Name:** \`$VERSION_NAME\`"
+            echo "- **Version Code:** \`$VERSION_CODE\`"
+            echo "- **Target APK:** \`$APK_FILENAME\` & \`$LATEST_APK_FILENAME\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify Release Signing Secrets
+        id: check_secrets
+        shell: bash
+        env:
+          HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+          HAS_STORE_PASS: ${{ secrets.STORE_PASSWORD != '' }}
+          HAS_KEY_PASS: ${{ secrets.KEY_PASSWORD != '' }}
+        run: |
+          MISSING=()
+          if [ "$HAS_KEYSTORE" != "true" ]; then MISSING+=("ANDROID_KEYSTORE_BASE64"); fi
+          if [ "$HAS_STORE_PASS" != "true" ]; then MISSING+=("STORE_PASSWORD"); fi
+          if [ "$HAS_KEY_PASS" != "true" ]; then MISSING+=("KEY_PASSWORD"); fi
+
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            MSG="Signed public release APK cannot be produced: missing GitHub Secrets (${MISSING[*]}). Configure ANDROID_KEYSTORE_BASE64, STORE_PASSWORD, and KEY_PASSWORD in Repository Settings -> Secrets and variables -> Actions."
+            echo "::error::$MSG"
+            {
+              echo "### Build Status: Build Failed"
+              echo "> **Missing Signing Credentials:** $MSG"
+              echo "> Previous verified APKs in \`public-available-release/\` were left untouched."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: "Status: Installing Dependencies – Checkout Repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Status: Installing Dependencies – Set up JDK 21"
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: "Status: Installing Dependencies – Set up Android SDK & Licenses"
+        shell: bash
+        run: |
+          {
+            echo "### Build Status: Installing Dependencies"
+            echo "Configuring Android SDK licenses and Gradle 9.3.1..."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+
+          SDKMANAGER_BIN=$(find "$SDK_DIR" -name "sdkmanager" -type f 2>/dev/null | head -n1 || true)
+          if [ -n "$SDKMANAGER_BIN" ]; then
+            set +o pipefail
+            yes | "$SDKMANAGER_BIN" --licenses >/dev/null 2>&1 || true
+            set -o pipefail
+          else
+            mkdir -p "$SDK_DIR/licenses"
+            printf '\n24333f8a63b6825ea9c5514f83c2829b004d1fee' > "$SDK_DIR/licenses/android-sdk-license"
+          fi
+
+      - name: "Status: Installing Dependencies – Set up Gradle 9.3.1"
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
+
+      - name: "Status: Building APK – Prepare Release Keystore"
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          KEYSTORE_FILE="${{ runner.temp }}/release-upload-key.jks"
+          echo "$ANDROID_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$KEYSTORE_FILE"
+
+          if [ ! -s "$KEYSTORE_FILE" ]; then
+            echo "::error::Decoded keystore file is empty or invalid."
+            exit 1
+          fi
+
+          # app/build.gradle.kts expects keyAlias = "upload".
+          # If the provided keystore uses a different alias, remap it on the temporary copy.
+          ALIAS_LIST=$(keytool -list -v -keystore "$KEYSTORE_FILE" -storepass:env STORE_PASSWORD 2>/dev/null | awk -F': ' '/Alias name:/{print $2}' || true)
+          if [ -z "$ALIAS_LIST" ]; then
+            echo "::error::Failed to read keystore entries. Check ANDROID_KEYSTORE_BASE64 and STORE_PASSWORD."
+            exit 1
+          fi
+
+          if ! echo "$ALIAS_LIST" | grep -qx "upload"; then
+            SOURCE_ALIAS="${ANDROID_KEY_ALIAS:-$(echo "$ALIAS_LIST" | head -n1)}"
+            echo "Remapping temporary keystore alias '$SOURCE_ALIAS' to 'upload'..."
+            keytool -changealias \
+              -keystore "$KEYSTORE_FILE" \
+              -storepass:env STORE_PASSWORD \
+              -alias "$SOURCE_ALIAS" \
+              -destalias "upload" \
+              -keypass:env KEY_PASSWORD
+          fi
+
+      - name: "Status: Building APK – Compile & Sign Release APK"
+        shell: bash
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/release-upload-key.jks
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          RELEASE_VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+          RELEASE_VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+        run: |
+          {
+            echo "### Build Status: Building APK"
+            echo "Compiling signed release build \`:app:assembleRelease\` for \`com.aistudio.nexo.btr\` v\`$RELEASE_VERSION_NAME\` (\`$RELEASE_VERSION_CODE\`)..."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          set -o pipefail
+          gradle :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee "${{ runner.temp }}/gradle-release-build.log"
+
+      - name: Clean Up Temporary Signing Keystore
+        if: always()
+        shell: bash
+        run: |
+          rm -f "${{ runner.temp }}/release-upload-key.jks"
+
+      - name: Verify Signed APK & Package Output
+        id: package
+        shell: bash
+        run: |
+          RELEASE_APK="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$RELEASE_APK" ]; then
+            echo "::error::Expected release APK was not generated at $RELEASE_APK"
+            exit 1
+          fi
+
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          APKSIGNER_BIN=$(find "$SDK_DIR/build-tools" -name "apksigner" -type f 2>/dev/null | sort -V | tail -n1 || true)
+          if [ -z "$APKSIGNER_BIN" ]; then
+            echo "::error::apksigner binary not found in Android SDK build-tools under $SDK_DIR."
+            exit 1
+          fi
+
+          "$APKSIGNER_BIN" verify --print-certs "$RELEASE_APK"
+
+          mkdir -p dist
+          OUT_APK="dist/${{ steps.meta.outputs.apk_filename }}"
+          OUT_LATEST="dist/${{ steps.meta.outputs.latest_apk_filename }}"
+          cp "$RELEASE_APK" "$OUT_APK"
+          cp "$RELEASE_APK" "$OUT_LATEST"
+
+          APK_SHA256=$(sha256sum "$OUT_APK" | awk '{print $1}')
+          APK_SIZE_BYTES=$(stat -c%s "$OUT_APK")
+          APK_SIZE=$(du -h "$OUT_APK" | awk '{print $1}')
+          echo "sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
+          echo "size_bytes=$APK_SIZE_BYTES" >> "$GITHUB_OUTPUT"
+          echo "size=$APK_SIZE" >> "$GITHUB_OUTPUT"
+          echo "verified_apk_path=${{ github.workspace }}/$OUT_APK" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Release APK to GitHub Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.apk_filename }}
+          path: |
+            dist/${{ steps.meta.outputs.apk_filename }}
+            dist/${{ steps.meta.outputs.latest_apk_filename }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach Signed APKs to GitHub Release
+        if: ${{ github.event_name == 'release' || inputs.attach_to_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ github.event.release.name || format('NEXO Battle Royale {0}', steps.meta.outputs.release_tag) }}
+          body: ${{ github.event.release.body || format('Official signed public release APK for NEXO Battle Royale {0}.', steps.meta.outputs.release_tag) }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/${{ steps.meta.outputs.apk_filename }}
+            dist/${{ steps.meta.outputs.latest_apk_filename }}
+          fail_on_unmatched_files: true
+
+      - name: Update public-available-release Storage on Default Branch
+        id: update_storage
+        if: ${{ success() && (github.event_name == 'release' || inputs.update_release_folder == true) }}
+        shell: bash
+        env:
+          RELEASE_NOTES: ${{ github.event.release.body }}
+        run: |
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          WORKTREE_DIR="${{ runner.temp }}/release-storage-worktree"
+          SCRIPT_PATH="${{ github.workspace }}/.github/scripts/update_release_storage.py"
+          VERIFIED_APK="${{ steps.package.outputs.verified_apk_path }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          git fetch origin "$DEFAULT_BRANCH"
+          git worktree add --detach -f "$WORKTREE_DIR" "origin/$DEFAULT_BRANCH"
+          cd "$WORKTREE_DIR"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 "$SCRIPT_PATH" \
+            --storage-dir "$WORKTREE_DIR/public-available-release" \
+            --apk-source "$VERIFIED_APK" \
+            --repo "${{ github.repository }}" \
+            --tag "${{ steps.meta.outputs.release_tag }}" \
+            --apk-filename "${{ steps.meta.outputs.apk_filename }}" \
+            --latest-filename "${{ steps.meta.outputs.latest_apk_filename }}" \
+            --version-name "${{ steps.meta.outputs.version_name }}" \
+            --version-code "${{ steps.meta.outputs.version_code }}" \
+            --sha256 "${{ steps.package.outputs.sha256 }}" \
+            --size-bytes "${{ steps.package.outputs.size_bytes }}" \
+            --size-human "${{ steps.package.outputs.size }}" \
+            --release-notes "$RELEASE_NOTES" \
+            --run-url "$RUN_URL" \
+            --commit-sha "${{ github.sha }}"
+
+          git add public-available-release/
+          if git diff --cached --quiet; then
+            echo "No changes to commit in public-available-release/."
+            exit 0
+          fi
+
+          git commit -m "chore(release): update public-available-release for ${{ steps.meta.outputs.release_tag }} [skip ci]"
+          if ! git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"; then
+            echo "::warning::Direct binary push to $DEFAULT_BRANCH failed (likely repository size/push limit). Falling back to metadata + GitHub Release Asset download links."
+            git reset --soft HEAD~1
+            git reset HEAD public-available-release/
+            git checkout -- public-available-release/NEXO-Public-Latest.apk "public-available-release/${{ steps.meta.outputs.apk_filename }}" 2>/dev/null || true
+            rm -f "public-available-release/NEXO-Public-Latest.apk" "public-available-release/${{ steps.meta.outputs.apk_filename }}"
+
+            python3 "$SCRIPT_PATH" \
+              --storage-dir "$WORKTREE_DIR/public-available-release" \
+              --apk-source "$VERIFIED_APK" \
+              --repo "${{ github.repository }}" \
+              --tag "${{ steps.meta.outputs.release_tag }}" \
+              --apk-filename "${{ steps.meta.outputs.apk_filename }}" \
+              --latest-filename "${{ steps.meta.outputs.latest_apk_filename }}" \
+              --version-name "${{ steps.meta.outputs.version_name }}" \
+              --version-code "${{ steps.meta.outputs.version_code }}" \
+              --sha256 "${{ steps.package.outputs.sha256 }}" \
+              --size-bytes "${{ steps.package.outputs.size_bytes }}" \
+              --size-human "${{ steps.package.outputs.size }}" \
+              --release-notes "$RELEASE_NOTES" \
+              --run-url "$RUN_URL" \
+              --commit-sha "${{ github.sha }}" \
+              --skip-binary
+
+            git add public-available-release/
+            git commit -m "chore(release): update public-available-release links for ${{ steps.meta.outputs.release_tag }} [skip ci]"
+            git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+          fi
+
+      - name: Clean Up Release Storage Worktree
+        if: always()
+        shell: bash
+        run: |
+          git worktree remove -f "${{ runner.temp }}/release-storage-worktree" 2>/dev/null || true
+
+      - name: "Status: Build Successful"
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo "### Build Status: Build Successful"
+            echo "- **Versioned APK:** \`${{ steps.meta.outputs.apk_filename }}\` (${{ steps.package.outputs.size }})"
+            echo "- **Latest APK:** \`${{ steps.meta.outputs.latest_apk_filename }}\`"
+            echo "- **Package ID:** \`com.aistudio.nexo.btr\`"
+            echo "- **Version Name:** \`${{ steps.meta.outputs.version_name }}\`"
+            echo "- **Version Code:** \`${{ steps.meta.outputs.version_code }}\`"
+            echo "- **SHA-256:** \`${{ steps.package.outputs.sha256 }}\`"
+            echo "- **Attached to Release:** \`${{ github.event_name == 'release' || inputs.attach_to_release == true }}\`"
+            echo "- **Storage Folder Updated:** \`public-available-release/\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Status: Build Failed – Upload Error Logs"
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### Build Status: Build Failed"
+            echo "> Previous verified APKs in \`public-available-release/\` were preserved and NOT replaced."
+            if [ -f "${{ runner.temp }}/gradle-release-build.log" ]; then
+              echo "<details><summary>Last 80 lines of Gradle build log</summary>"
+              echo ""
+              echo '```text'
+              tail -n 80 "${{ runner.temp }}/gradle-release-build.log"
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Failure Build Log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexo-build-failure-log
+          path: ${{ runner.temp }}/gradle-release-build.log
+          if-no-files-found: ignore
+          retention-days: 14

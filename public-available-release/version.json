@@ -1,0 +1,26 @@
+{
+  "appName": "NEXO",
+  "studio": "RK Animation Studios",
+  "packageId": "com.aistudio.nexo.btr",
+  "latestTag": null,
+  "latestVersionName": "0.1",
+  "latestVersionCode": 1,
+  "latestApkFilename": "NEXO-Public-Latest.apk",
+  "versionedApkFilename": null,
+  "buildStatus": "AWAITING_FIRST_SIGNED_RELEASE",
+  "lastUpdatedUtc": null,
+  "sha256": null,
+  "sizeHuman": null,
+  "supportedAndroid": {
+    "minSdk": 24,
+    "minAndroidVersion": "Android 7.0 (Nougat)",
+    "targetSdk": 36,
+    "targetAndroidVersion": "Android 16"
+  },
+  "downloadUrls": {
+    "latestReleaseAsset": null,
+    "versionedReleaseAsset": null,
+    "repoLatestApk": null
+  },
+  "history": []
+}

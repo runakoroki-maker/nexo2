@@ -1,0 +1,8 @@
+{
+  "name": "Remix NEXO",
+  "description": "NEXO Battle Royale Base APK v0.1 by RK Animation Studios",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
